@@ -388,6 +388,10 @@ Notice the weight tying: `logits = x @ self.embedding.token_embed.T`. The output
 
 For a real training run on 124M parameters, you would need a GPU and PyTorch. This training loop demonstrates the mechanics on a small model that runs in pure numpy. We use a tiny model (4 layers, 4 heads, 128 dims) to make it tractable.
 
+Training is four moves repeated: forward pass, loss, backward pass, update. PyTorch hides the backward pass behind `loss.backward()`. Here you write it yourself, so every parameter needs its own gradient: embeddings, all four attention matrices, both layer norms in every block, the FFN, and the final layer norm. Skip one and that parameter stays at its random initial value forever.
+
+The loss is cross-entropy over next-token predictions:
+
 ```python
 def cross_entropy_loss(logits, targets):
     batch, seq_len, vocab_size = logits.shape
@@ -401,20 +405,73 @@ def cross_entropy_loss(logits, targets):
 
     loss = -log_softmax[np.arange(len(targets_flat)), targets_flat].mean()
     return loss
+```
 
+The attention backward pass is the one people get wrong. Work backwards through the forward computation: output projection, then `weights @ V`, then softmax, then `Q @ K^T`, then the three input projections. The softmax step uses the identity `dS = P * (dP - sum(dP * P))`.
 
+```python
+def attention_backward(dy, x_in, attn, mask):
+    batch, seq_len, d = x_in.shape
+    h, hd = attn.num_heads, attn.head_dim
+
+    def split(t):
+        return t.reshape(batch, seq_len, h, hd).transpose(0, 2, 1, 3)
+
+    def merge(t):
+        return t.transpose(0, 2, 1, 3).reshape(batch, seq_len, d)
+
+    Q, K, V = split(x_in @ attn.W_q), split(x_in @ attn.W_k), split(x_in @ attn.W_v)
+    scores = Q @ K.transpose(0, 1, 3, 2) / np.sqrt(hd) + mask
+    weights = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    weights = weights / weights.sum(axis=-1, keepdims=True)
+    attn_out = merge(weights @ V)
+
+    flat = lambda t: t.reshape(-1, d)
+    grad_W_out = flat(attn_out).T @ flat(dy)
+    d_out = split(dy @ attn.W_out.T)
+
+    d_weights = d_out @ V.transpose(0, 1, 3, 2)
+    dV = weights.transpose(0, 1, 3, 2) @ d_out
+    d_scores = weights * (d_weights - (d_weights * weights).sum(axis=-1, keepdims=True))
+    d_scores /= np.sqrt(hd)
+    dQ = merge(d_scores @ K)
+    dK = merge(d_scores.transpose(0, 1, 3, 2) @ Q)
+    dV = merge(dV)
+
+    grad_W_q = flat(x_in).T @ flat(dQ)
+    grad_W_k = flat(x_in).T @ flat(dK)
+    grad_W_v = flat(x_in).T @ flat(dV)
+    dx = dQ @ attn.W_q.T + dK @ attn.W_k.T + dV @ attn.W_v.T
+
+    return dx, grad_W_q, grad_W_k, grad_W_v, grad_W_out
+```
+
+Each transformer block computes `x_mid = x + attn(ln1(x))` and then `x_out = x_mid + ffn(ln2(x_mid))`. Going backwards, the gradient splits at every residual: one copy flows straight down the skip path, the other flows through the sublayer and its layer norm, and the two are added back together. This is the "gradient highway" the residual connections give you:
+
+```python
+for block, (x_in, ln1_out, x_mid, ln2_out) in reversed(list(zip(model.blocks, cache))):
+    d_ffn_in, gW1, gb1, gW2, gb2 = ffn_backward(dx, ln2_out, block.ffn)
+    d_mid, g_ln2_gamma, g_ln2_beta = layernorm_backward(d_ffn_in, x_mid, block.ln2)
+    d_mid = dx + d_mid
+
+    d_attn_in, gWq, gWk, gWv, gWo = attention_backward(d_mid, ln1_out, block.attn, mask)
+    d_in, g_ln1_gamma, g_ln1_beta = layernorm_backward(d_attn_in, x_in, block.ln1)
+    dx = d_mid + d_in
+```
+
+At the bottom, `dx` flows into the embeddings. The token embedding receives gradient twice: once as the output head (weight tying) and once from the input lookup. `code/main.py` collects all of this in `loss_and_grads(model, input_ids, target_ids)`, which returns the loss and one gradient per parameter. `code/test_main.py` checks every one of those gradients against a finite-difference estimate. Run it whenever you change the backward pass.
+
+The training loop itself is short:
+
+```python
 def train_mini_gpt(text, vocab_size=256, embed_dim=128, num_heads=4,
-                   num_layers=4, seq_len=64, num_steps=200, lr=3e-4):
+                   num_layers=4, seq_len=64, num_steps=200, lr=1e-3):
     tokens = np.array(list(text.encode("utf-8")[:2048]))
     model = MiniGPT(
         vocab_size=vocab_size, embed_dim=embed_dim, num_heads=num_heads,
         num_layers=num_layers, max_seq_len=seq_len, ff_dim=embed_dim * 4
     )
-
-    print(f"Model parameters: {model.count_parameters():,}")
-    print(f"Training tokens: {len(tokens):,}")
-    print(f"Config: {num_layers} layers, {num_heads} heads, {embed_dim} dims")
-    print()
+    optimizer = Adam(parameters(model), lr=lr)
 
     for step in range(num_steps):
         start_idx = np.random.randint(0, max(1, len(tokens) - seq_len - 1))
@@ -423,18 +480,18 @@ def train_mini_gpt(text, vocab_size=256, embed_dim=128, num_heads=4,
         input_ids = batch_tokens[:-1].reshape(1, -1)
         target_ids = batch_tokens[1:].reshape(1, -1)
 
-        logits = model.forward(input_ids)
-        loss = cross_entropy_loss(logits, target_ids)
+        loss, grads = loss_and_grads(model, input_ids, target_ids)
+        optimizer.step(grads)
 
-        if step % 20 == 0:
+        if step % 20 == 0 or step == num_steps - 1:
             print(f"Step {step:4d} | Loss: {loss:.4f}")
 
     return model
 ```
 
-The loss starts near ln(vocab_size) -- for a 256-token byte-level vocabulary, that is ln(256) = 5.55. A random model assigns equal probability to every token. As training progresses, the loss drops because the model learns to predict common patterns: "th" after "t", space after a period, and so on.
+The loss starts near ln(vocab_size) -- for a 256-token byte-level vocabulary, that is ln(256) = 5.55. A random model assigns equal probability to every token. As training progresses, the loss drops because the model learns to predict common patterns: "th" after "t", space after a period, and so on. On the lesson corpus it falls from about 5.57 to about 2.2 in 200 steps, and the generated text turns from random bytes into English-shaped words. If your loss stays near 5.55, something in the backward pass is broken: a parameter is not getting its gradient.
 
-In production, you would use Adam optimizer with gradient accumulation, learning rate warmup, and gradient clipping. The forward-pass-loss-backward-update loop is identical. The optimizer is more sophisticated.
+We use Adam rather than plain gradient descent because plain SGD at this learning rate barely moves in 200 steps. In production you would add gradient accumulation, learning rate warmup, and gradient clipping. The forward-pass-loss-backward-update loop is identical.
 
 ### Step 7: Text Generation
 

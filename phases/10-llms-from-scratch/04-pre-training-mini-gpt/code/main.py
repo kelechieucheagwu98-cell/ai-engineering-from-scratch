@@ -187,17 +187,132 @@ def ffn_backward(dy, x_in, ffn):
     return dx, grad_W1, grad_b1, grad_W2, grad_b2
 
 
+def attention_backward(dy, x_in, attn, mask):
+    batch, seq_len, d = x_in.shape
+    h, hd = attn.num_heads, attn.head_dim
+
+    def split(t):
+        return t.reshape(batch, seq_len, h, hd).transpose(0, 2, 1, 3)
+
+    def merge(t):
+        return t.transpose(0, 2, 1, 3).reshape(batch, seq_len, d)
+
+    Q, K, V = split(x_in @ attn.W_q), split(x_in @ attn.W_k), split(x_in @ attn.W_v)
+    scores = Q @ K.transpose(0, 1, 3, 2) / np.sqrt(hd) + mask
+    weights = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    weights = weights / weights.sum(axis=-1, keepdims=True)
+    attn_out = merge(weights @ V)
+
+    flat = lambda t: t.reshape(-1, d)
+    grad_W_out = flat(attn_out).T @ flat(dy)
+    d_out = split(dy @ attn.W_out.T)
+
+    d_weights = d_out @ V.transpose(0, 1, 3, 2)
+    dV = weights.transpose(0, 1, 3, 2) @ d_out
+    d_scores = weights * (d_weights - (d_weights * weights).sum(axis=-1, keepdims=True))
+    d_scores /= np.sqrt(hd)
+    dQ = merge(d_scores @ K)
+    dK = merge(d_scores.transpose(0, 1, 3, 2) @ Q)
+    dV = merge(dV)
+
+    grad_W_q = flat(x_in).T @ flat(dQ)
+    grad_W_k = flat(x_in).T @ flat(dK)
+    grad_W_v = flat(x_in).T @ flat(dV)
+    dx = dQ @ attn.W_q.T + dK @ attn.W_k.T + dV @ attn.W_v.T
+
+    return dx, grad_W_q, grad_W_k, grad_W_v, grad_W_out
+
+
+def parameters(model):
+    params = [model.embedding.token_embed, model.embedding.pos_embed]
+    for block in model.blocks:
+        params += [block.ln1.gamma, block.ln1.beta,
+                   block.attn.W_q, block.attn.W_k, block.attn.W_v, block.attn.W_out,
+                   block.ln2.gamma, block.ln2.beta,
+                   block.ffn.W1, block.ffn.b1, block.ffn.W2, block.ffn.b2]
+    params += [model.ln_f.gamma, model.ln_f.beta]
+    return params
+
+
+def loss_and_grads(model, input_ids, target_ids):
+    seq_len = input_ids.shape[-1]
+    mask = np.triu(np.full((seq_len, seq_len), -1e9), k=1)
+    x = model.embedding.forward(input_ids)
+    cache = []
+    for block in model.blocks:
+        ln1_out = block.ln1.forward(x)
+        x_mid = x + block.attn.forward(ln1_out, mask)
+        ln2_out = block.ln2.forward(x_mid)
+        cache.append((x, ln1_out, x_mid, ln2_out))
+        x = x_mid + block.ffn.forward(ln2_out)
+    x_normed = model.ln_f.forward(x)
+    logits = x_normed @ model.embedding.token_embed.T
+    loss = cross_entropy_loss(logits, target_ids)
+    batch_size, s_len, _ = logits.shape
+    probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    probs = probs / probs.sum(axis=-1, keepdims=True)
+    dlogits = probs
+    dlogits[np.arange(batch_size)[:, None], np.arange(s_len), target_ids] -= 1.0
+    dlogits /= (batch_size * s_len)
+    grad_token_embed = dlogits.reshape(-1, dlogits.shape[-1]).T @ x_normed.reshape(-1, x_normed.shape[-1])
+    dx_normed = dlogits @ model.embedding.token_embed
+    dx, g_lnf_gamma, g_lnf_beta = layernorm_backward(dx_normed, x, model.ln_f)
+
+    block_grads = []
+    for block, (x_in, ln1_out, x_mid, ln2_out) in reversed(list(zip(model.blocks, cache))):
+        d_ffn_in, gW1, gb1, gW2, gb2 = ffn_backward(dx, ln2_out, block.ffn)
+        d_mid, g_ln2_gamma, g_ln2_beta = layernorm_backward(d_ffn_in, x_mid, block.ln2)
+        d_mid = dx + d_mid
+        d_attn_in, gWq, gWk, gWv, gWo = attention_backward(d_mid, ln1_out, block.attn, mask)
+        d_in, g_ln1_gamma, g_ln1_beta = layernorm_backward(d_attn_in, x_in, block.ln1)
+        dx = d_mid + d_in
+
+        block_grads.append([g_ln1_gamma, g_ln1_beta, gWq, gWk, gWv, gWo,
+                            g_ln2_gamma, g_ln2_beta, gW1, gb1, gW2, gb2])
+    np.add.at(grad_token_embed, input_ids.reshape(-1), dx.reshape(-1, dx.shape[-1]))
+    grad_pos_embed = np.zeros_like(model.embedding.pos_embed)
+    grad_pos_embed[:seq_len] = dx.sum(axis=0)
+
+    grads = [grad_token_embed, grad_pos_embed]
+    for g in reversed(block_grads):
+        grads += g
+    grads += [g_lnf_gamma, g_lnf_beta]
+    return loss, grads
+
+
+class Adam:
+    def __init__(self, params, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8):
+        self.params, self.lr = params, lr
+        self.beta1, self.beta2, self.eps = beta1, beta2, eps
+        self.m = [np.zeros_like(p) for p in params]
+        self.v = [np.zeros_like(p) for p in params]
+        self.t = 0
+
+    def step(self, grads):
+        self.t += 1
+        for p, g, m, v in zip(self.params, grads, self.m, self.v):
+            m *= self.beta1
+            m += (1 - self.beta1) * g
+            v *= self.beta2
+            v += (1 - self.beta2) * g * g
+            m_hat = m / (1 - self.beta1 ** self.t)
+            v_hat = v / (1 - self.beta2 ** self.t)
+            p -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+
+
 def train_mini_gpt(text, vocab_size=256, embed_dim=128, num_heads=4,
-                   num_layers=4, seq_len=64, num_steps=200, lr=3e-4):
+                   num_layers=4, seq_len=64, num_steps=200, lr=1e-3):
     tokens = np.array(list(text.encode("utf-8")[:2048]))
     model = MiniGPT(
         vocab_size=vocab_size, embed_dim=embed_dim, num_heads=num_heads,
         num_layers=num_layers, max_seq_len=seq_len, ff_dim=embed_dim * 4
     )
+    optimizer = Adam(parameters(model), lr=lr)
 
     print(f"Model parameters: {model.count_parameters():,}")
     print(f"Training tokens: {len(tokens):,}")
     print(f"Config: {num_layers} layers, {num_heads} heads, {embed_dim} dims")
+    print(f"Random-guess loss: ln({vocab_size}) = {np.log(vocab_size):.4f}")
     print()
 
     for step in range(num_steps):
@@ -207,64 +322,10 @@ def train_mini_gpt(text, vocab_size=256, embed_dim=128, num_heads=4,
         input_ids = batch_tokens[:-1].reshape(1, -1)
         target_ids = batch_tokens[1:].reshape(1, -1)
 
-        mask = np.triu(np.full((seq_len, seq_len), -1e9), k=1)
-        x = model.embedding.forward(input_ids)
-        block_inputs = [x]
-        for block in model.blocks:
-            x = block.forward(x, mask)
-            block_inputs.append(x)
-        x_pre_ln = x
-        x_normed = model.ln_f.forward(x_pre_ln)
-        logits = x_normed @ model.embedding.token_embed.T
+        loss, grads = loss_and_grads(model, input_ids, target_ids)
+        optimizer.step(grads)
 
-        loss = cross_entropy_loss(logits, target_ids)
-
-        batch_size, s_len, v_size = logits.shape
-        probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
-        probs = probs / probs.sum(axis=-1, keepdims=True)
-        dlogits = probs.copy()
-        dlogits[np.arange(batch_size)[:, None], np.arange(s_len), target_ids] -= 1.0
-        dlogits /= (batch_size * s_len)
-
-        grad_token_embed = np.zeros_like(model.embedding.token_embed)
-        for b in range(batch_size):
-            grad_token_embed += dlogits[b].T @ x_normed[b]
-
-        dx_normed = dlogits @ model.embedding.token_embed
-
-        dx_pre_ln, grad_ln_gamma, grad_ln_beta = layernorm_backward(
-            dx_normed, x_pre_ln, model.ln_f
-        )
-
-        dx = dx_pre_ln
-        for i in range(len(model.blocks) - 1, -1, -1):
-            block = model.blocks[i]
-            block_in = block_inputs[i]
-
-            ln2_in = block_in + block.attn.forward(block.ln1.forward(block_in), mask)
-            ln2_out = block.ln2.forward(ln2_in)
-
-            dffn, gW1, gb1, gW2, gb2 = ffn_backward(dx, ln2_out, block.ffn)
-
-            dln2_out = dffn
-            dln2_in, g_ln2_gamma, g_ln2_beta = layernorm_backward(
-                dln2_out, ln2_in, block.ln2
-            )
-
-            dx = dx + dln2_in
-
-            block.ffn.W1 -= lr * gW1
-            block.ffn.b1 -= lr * gb1
-            block.ffn.W2 -= lr * gW2
-            block.ffn.b2 -= lr * gb2
-            block.ln2.gamma -= lr * g_ln2_gamma
-            block.ln2.beta -= lr * g_ln2_beta
-
-        model.ln_f.gamma -= lr * grad_ln_gamma
-        model.ln_f.beta -= lr * grad_ln_beta
-        model.embedding.token_embed -= lr * grad_token_embed
-
-        if step % 20 == 0:
+        if step % 20 == 0 or step == num_steps - 1:
             print(f"Step {step:4d} | Loss: {loss:.4f}")
 
     return model
